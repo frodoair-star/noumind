@@ -3,7 +3,17 @@ node_pipeline.py — Узел пользователя
 Держит слои 11-21 TinyLlama + EFCT нейрон.
 Pull-модель: сам опрашивает Gateway каждые 2 сек.
 """
-import sys, os, io, asyncio, argparse, socket, base64, time
+# -*- coding: utf-8 -*-
+import sys
+import io
+sys.stdout = io.TextIOWrapper(
+    sys.stdout.buffer, encoding='utf-8', errors='replace'
+)
+sys.stderr = io.TextIOWrapper(
+    sys.stderr.buffer, encoding='utf-8', errors='replace'
+)
+
+import os, asyncio, argparse, socket, base64, time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from fastapi import FastAPI
@@ -605,7 +615,7 @@ async def lifespan(application):
     yield
     task.cancel()
 
-app = FastAPI(title=f"Noümind Node {WORKER_ID}", lifespan=lifespan)
+app = FastAPI(title=f"Noumind Node {WORKER_ID}", lifespan=lifespan)
 
 @app.get("/metrics")
 def metrics():
@@ -708,7 +718,7 @@ def efct_stats():
 
 if __name__ == "__main__":
     print("="*55)
-    print(f"  Noümind Pipeline Node")
+    print(f"  Noumind Pipeline Node")
     print(f"  ID:      {WORKER_ID}")
     print(f"  Слои:    {LAYER_START}-{LAYER_END}")
     print(f"  Gateway: {GATEWAY_URL}")
