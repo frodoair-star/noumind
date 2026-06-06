@@ -125,15 +125,20 @@ print(f"[Node] Модель загружена", flush=True)
 # УСТРОЙСТВО
 # ─────────────────────────────────────────
 
-if torch.cuda.is_available():
-    device = "cuda"
-    tier   = "gpu"
-elif torch.backends.mps.is_available():
-    device = "mps"
-    tier   = "fast_cpu"
+# GPU/CPU выбор
+if os.environ.get('FORCE_CPU') == '1':
+    device = 'cpu'
+    tier = 'slow_cpu'
 else:
-    device = "cpu"
-    tier   = "slow_cpu"
+    if torch.cuda.is_available():
+        device = 'cuda'
+        tier = 'gpu'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+        tier = 'fast_cpu'
+    else:
+        device = 'cpu'
+        tier = 'slow_cpu'
 
 full_model = full_model.to(device)
 print(f"[Node] Device: {device} | Tier: {tier}", flush=True)
