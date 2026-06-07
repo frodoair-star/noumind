@@ -276,15 +276,21 @@ async def send_task_to_worker(worker_id: str, task: dict) -> str:
 
 async def start_ws_server():
     """Запускаем WebSocket-сервер для обратных подключений узлов."""
-    print(f"[Gateway] Reverse WebSocket сервер на порту {WS_PORT}")
-    async with websockets.serve(
-        handle_node_connection,
-        "0.0.0.0",
-        WS_PORT,
-        ping_interval = 20,
-        ping_timeout  = 60,
-    ):
-        await asyncio.Future()  # держим до остановки event loop
+    from websockets.asyncio.server import serve as ws_serve
+    print(f"[Gateway] Reverse WebSocket сервер на порту {WS_PORT}", flush=True)
+    try:
+        async with ws_serve(
+            handle_node_connection,
+            "0.0.0.0",
+            WS_PORT,
+            ping_interval = 20,
+            ping_timeout  = 60,
+        ) as srv:
+            print(f"[Gateway] ✓ WS сервер запущен: {srv.sockets}", flush=True)
+            await asyncio.Future()  # держим до остановки event loop
+    except Exception as e:
+        print(f"[Gateway] ✗ WS сервер упал: {type(e).__name__}: {e}", flush=True)
+        raise
 
 # ─────────────────────────────────────────
 # ФЕДЕРАТИВНОЕ ОБУЧЕНИЕ — gates store
