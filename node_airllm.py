@@ -230,7 +230,7 @@ def load_model(layer_start: int, layer_end: int) -> dict:
 # INFERENCE — forward через назначенные слои
 # ─────────────────────────────────────────
 
-def run_inference(mdl_bundle: dict, message: str, max_new_tokens: int = 200) -> str:
+def run_inference(mdl_bundle: dict, message: str, max_new_tokens: int = 30) -> str:
     """
     Greedy decode через частичную модель (только наши слои).
     Полноценный ответ — когда узел покрывает все 32 слоя (слои 0-31).
@@ -451,7 +451,7 @@ async def connect_and_work():
                             tasks_done_efct += 1
                             efct.save(GATES_PATH)
                             print(f"[EFCT] task={tasks_done_efct} "
-                                  f"signal={signal_src}({quality or 0.5:.3f}) "
+                                  f"signal={signal_src}({quality if quality is not None else 0.5:.3f}) "
                                   f"baseline={efct.baseline:.4f} "
                                   f"dist={efct.identity_distance():.6f}", flush=True)
 

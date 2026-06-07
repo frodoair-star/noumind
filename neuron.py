@@ -24,7 +24,7 @@ class Neuron:
         self.tasks_done = 0
         
         # Скользящее среднее для baseline
-        self.baseline = None
+        self.baseline = 0.5
         self.baseline_alpha = 0.1  # скорость адаптации baseline
     
     def forward(self, activations):
@@ -40,13 +40,6 @@ class Neuron:
         signal = (raw_quality - baseline) / baseline  → нормализован
         """
         with torch.no_grad():
-            # Инициализируем baseline при первом запросе
-            if self.baseline is None:
-                self.baseline = raw_quality
-                self.com_history.append(0.0)
-                self.tasks_done += 1
-                return
-            
             # Нормализованный сигнал: +1 = вдвое лучше baseline
             if self.baseline > 1e-10:
                 signal = (raw_quality - self.baseline) / (abs(self.baseline) + 1e-10)
