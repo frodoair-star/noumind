@@ -3,7 +3,7 @@ gateway_pipeline.py — VPS
 AirLLM backend: Mistral-7B-Instruct-v0.2 (layer streaming, ~0.4 GB RAM).
 Раздаёт активации узлам через pull модель (distributed pipeline остаётся).
 """
-import sys, os, io, asyncio, uuid, base64, time, re
+import sys, os, io, asyncio, uuid, base64, time, re, json
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -12,10 +12,11 @@ from typing import Dict
 import torch
 from transformers import AutoTokenizer
 from airllm import AutoModel
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
+import websockets
 
 try:
     import feedparser
@@ -35,6 +36,7 @@ MODEL_NAME   = "mistralai/Mistral-7B-Instruct-v0.2"
 LAYER_START  = 0
 LAYER_END    = 31   # Mistral-7B: 32 decoder layers (0-31)
 PORT         = 8002
+WS_PORT      = 8003  # Reverse WebSocket — узлы подключаются сюда сами
 
 # ─────────────────────────────────────────
 # ЗАГРУЗКА МОДЕЛИ — AirLLM (layer streaming)
@@ -137,9 +139,234 @@ worker_stats: Dict[str, dict] = {}
 streaming_queues: Dict[str, asyncio.Queue] = {}
 
 # ─────────────────────────────────────────
+# Reverse WebSocket — узлы подключаются к Gateway сами
+# ─────────────────────────────────────────
+reverse_ws_connections: Dict[str, any] = {}  # worker_id → websocket
+result_events: Dict[str, asyncio.Event] = {} # task_id  → Event (сигнал готовности)
+
+
+async def handle_node_connection(websocket):
+    """
+    Узел сам подключается сюда (reverse WS).
+    Первое сообщение — {"type":"register", "worker_id":...}.
+    Gateway держит соединение открытым и шлёт задачи.
+    """
+    worker_id = None
+    try:
+        # ── 1. Регистрация ───────────────────────────────
+        raw  = await asyncio.wait_for(websocket.recv(), timeout=30)
+        data = json.loads(raw)
+
+        if data.get("type") != "register":
+            await websocket.close(1008, "First message must be register")
+            return
+
+        worker_id = data["worker_id"]
+        reverse_ws_connections[worker_id] = websocket
+
+        # Обновляем/создаём статус узла
+        prev = worker_stats.get(worker_id, {})
+        worker_stats[worker_id] = {
+            **prev,
+            "status":    "ready",
+            "tier":      data.get("tier",    "slow_cpu"),
+            "device":    data.get("device",  "cpu"),
+            "ram_gb":    data.get("ram_gb",  4.0),
+            "vram_gb":   data.get("vram_gb", 0.0),
+            "model":     data.get("model",   ""),
+            "backend":   "airllm_ws",
+            "last_seen": time.time(),
+        }
+
+        # Назначаем слои если ещё не назначены
+        if worker_id not in layer_assignments:
+            effective = data.get("vram_gb") or data.get("ram_gb", 4.0)
+            assign_layers(worker_id, effective)
+
+        ls, le = layer_assignments.get(worker_id, (0, 31))
+        worker_stats[worker_id]["layer_start"] = ls
+        worker_stats[worker_id]["layer_end"]   = le
+
+        print(f"[Gateway] ✓ Узел подключён (reverse WS): {worker_id} "
+              f"({data.get('tier')}) слои {ls}-{le} "
+              f"покрытие {get_coverage()['percent']}%")
+
+        # ── 2. Подтверждаем регистрацию ──────────────────
+        await websocket.send(json.dumps({
+            "type":        "registered",
+            "worker_id":   worker_id,
+            "layer_start": ls,
+            "layer_end":   le,
+            "model":       MODEL_NAME,
+            "coverage":    get_coverage(),
+        }))
+
+        # ── 3. Цикл приёма сообщений от узла ─────────────
+        async for message in websocket:
+            data = json.loads(message)
+            msg_type = data.get("type")
+
+            if msg_type == "result":
+                task_id = data.get("task_id", "")
+                text    = data.get("text", "")
+                result_store[task_id] = text
+                ev = result_events.get(task_id)
+                if ev:
+                    ev.set()
+                print(f"[Gateway] ← результат {task_id[:8]} "
+                      f"от {worker_id}: '{text[:50]}'")
+
+            elif msg_type == "heartbeat":
+                worker_stats[worker_id]["last_seen"] = time.time()
+                await websocket.send(json.dumps({"type": "pong"}))
+
+            elif msg_type == "ready":
+                # Узел сообщает что модель загружена
+                worker_stats[worker_id]["status"] = "ready"
+                print(f"[Gateway] {worker_id} → модель готова")
+
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    except Exception as e:
+        print(f"[Gateway] WS ошибка ({worker_id}): {e}")
+    finally:
+        if worker_id:
+            reverse_ws_connections.pop(worker_id, None)
+            if worker_id in worker_stats:
+                worker_stats[worker_id]["status"] = "offline"
+            print(f"[Gateway] Узел отключился: {worker_id}")
+
+
+def _ws_is_open(ws) -> bool:
+    """Проверяем что соединение открыто (совместимо с websockets 10-16)."""
+    # websockets >=13 убрал .closed; используем .open или state
+    if hasattr(ws, 'open'):
+        return ws.open
+    if hasattr(ws, 'state'):
+        from websockets.connection import State
+        return ws.state == State.OPEN
+    # Fallback: если объект в словаре — считаем живым
+    return True
+
+
+async def send_task_to_worker(worker_id: str, task: dict) -> str:
+    """
+    Шлём задачу узлу через обратное WS-соединение.
+    Ждём ответ через asyncio.Event (не polling).
+    """
+    ws = reverse_ws_connections.get(worker_id)
+    if ws is None:
+        raise Exception(f"Узел {worker_id} не подключён")
+
+    task_id = task["task_id"]
+    ev = asyncio.Event()
+    result_events[task_id] = ev
+    result_store[task_id]  = None
+
+    try:
+        await ws.send(json.dumps(task))
+        await asyncio.wait_for(ev.wait(), timeout=120.0)
+        return result_store.pop(task_id, "")
+    except asyncio.TimeoutError:
+        raise Exception(f"Timeout: узел {worker_id} не ответил за 120с")
+    finally:
+        result_events.pop(task_id, None)
+        result_store.pop(task_id, None)
+
+
+async def start_ws_server():
+    """Запускаем WebSocket-сервер для обратных подключений узлов."""
+    print(f"[Gateway] Reverse WebSocket сервер на порту {WS_PORT}")
+    async with websockets.serve(
+        handle_node_connection,
+        "0.0.0.0",
+        WS_PORT,
+        ping_interval = 20,
+        ping_timeout  = 60,
+    ):
+        await asyncio.Future()  # держим до остановки event loop
+
+# ─────────────────────────────────────────
 # ФЕДЕРАТИВНОЕ ОБУЧЕНИЕ — gates store
 # ─────────────────────────────────────────
 gates_store: Dict[str, dict] = {}
+
+# ─────────────────────────────────────────
+# DISTRIBUTED PIPELINE — назначение слоёв
+# ─────────────────────────────────────────
+
+DISTRIBUTED_MODEL = {
+    "id":           "mistralai/Mistral-7B-Instruct-v0.2",
+    "total_layers": 32,
+    "layers_per_gb": 2.5,   # слоёв на 1 GB RAM/VRAM
+}
+
+layer_assignments: Dict[str, tuple] = {}   # worker_id → (start, end)
+
+
+def assign_layers(worker_id: str, ram_gb: float) -> tuple:
+    """Назначаем узлу незанятые слои, пропорционально его RAM."""
+    total = DISTRIBUTED_MODEL["total_layers"]
+
+    occupied: set = set()
+    for wid, (s, e) in layer_assignments.items():
+        if wid != worker_id:
+            for ll in range(s, e + 1):
+                occupied.add(ll)
+
+    my_count = max(1, min(
+        int(ram_gb * DISTRIBUTED_MODEL["layers_per_gb"]),
+        total - len(occupied),
+    ))
+
+    # Первый свободный непрерывный диапазон
+    start = 0
+    while start < total and start in occupied:
+        start += 1
+
+    end = min(start + my_count - 1, total - 1)
+
+    # Если диапазон пересекается — сдвигаем дальше
+    while any(ll in occupied for ll in range(start, end + 1)) and start < total:
+        start = end + 1
+        end   = min(start + my_count - 1, total - 1)
+    if start >= total:
+        start = 0
+        end   = min(my_count - 1, total - 1)
+
+    layer_assignments[worker_id] = (start, end)
+    print(f"[Gateway] {worker_id[:16]}: слои {start}-{end} "
+          f"({my_count} сл, {ram_gb:.1f} GB)")
+    return start, end
+
+
+def build_pipeline_chain() -> list:
+    """Цепочка узлов, отсортированная по layer_start."""
+    chain = []
+    for wid, (s, e) in sorted(layer_assignments.items(), key=lambda x: x[1][0]):
+        if wid in worker_stats and worker_stats[wid].get("status") in ("free", "ready"):
+            chain.append({
+                "worker_id":   wid,
+                "layer_start": s,
+                "layer_end":   e,
+                "tier":        worker_stats[wid].get("tier", "slow_cpu"),
+            })
+    return chain
+
+
+def get_coverage() -> dict:
+    """Какой процент слоёв модели покрыт."""
+    total   = DISTRIBUTED_MODEL["total_layers"]
+    covered = set()
+    for s, e in layer_assignments.values():
+        for ll in range(s, e + 1):
+            covered.add(ll)
+    return {
+        "covered": len(covered),
+        "total":   total,
+        "percent": round(len(covered) / total * 100),
+        "missing": [ll for ll in range(total) if ll not in covered],
+    }
 
 # ─────────────────────────────────────────
 # НОЧНОЙ КРАУЛЕР — источники и состояние
@@ -430,6 +657,10 @@ scheduler = AsyncIOScheduler() if _CRAWLER_DEPS else None
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    # Запускаем Reverse WebSocket сервер для узлов
+    asyncio.create_task(start_ws_server())
+    print(f"[Gateway] Reverse WS сервер запущен (порт {WS_PORT})")
+
     if scheduler and _CRAWLER_DEPS:
         scheduler.add_job(crawl_and_train, "cron", hour=2, minute=0, id="nightly_crawl")
         scheduler.add_job(
@@ -529,30 +760,58 @@ class RegisterPayload(BaseModel):
 
 @app.post("/register")
 async def register_worker(
+    request:        Request,
     worker_id:      str,
-    tier:           str  = "slow_cpu",
-    device:         str  = "cpu",
-    ram_gb:         int  = 0,
-    specialization: str  = "general",
-    is_fallback:    bool = False,
+    tier:           str   = "slow_cpu",
+    device:         str   = "cpu",
+    ram_gb:         float = 0,
+    vram_gb:        float = 0,
+    layer_start:    int   = -1,
+    layer_end:      int   = -1,
+    model:          str   = "",
+    backend:        str   = "",
+    specialization: str   = "general",
+    is_fallback:    bool  = False,
+    ws_port:        int   = 9010,
     payload:        RegisterPayload | None = None,
 ):
-    prev = worker_stats.get(worker_id, {})
+    prev      = worker_stats.get(worker_id, {})
+    client_ip = request.client.host if request.client else "unknown"
+
     worker_stats[worker_id] = {
         "tier":            tier,
         "device":          device,
         "ram_gb":          ram_gb,
-        "status":          "free",
+        "vram_gb":         vram_gb,
+        "status":          "ready",
         "tasks_done":      prev.get("tasks_done", 0),
         "avg_speed":       prev.get("avg_speed", 999),
         "specialization":  specialization,
         "is_fallback":     is_fallback,
+        "backend":         backend,
         "category_scores": (payload.category_scores if payload and payload.category_scores
                             else prev.get("category_scores", {})),
+        # WebSocket — для Gateway → Node соединений
+        "ws_port":         ws_port,
+        "host":            client_ip,
+        "last_seen":       time.time(),
     }
+
+    # Sync layer assignment if node tells us its layers
+    if layer_start >= 0 and layer_end >= 0:
+        layer_assignments[worker_id] = (layer_start, layer_end)
+
+    coverage = get_coverage()
     role = "Shared Expert" if is_fallback else f"Routed Expert [{specialization}]"
-    print(f"[Gateway] ✓ Воркер зарегистрирован: {worker_id} | {role} | tier={tier}")
-    return {"status": "registered", "worker_id": worker_id, "specialization": specialization}
+    print(f"[Gateway] ✓ {worker_id[:20]} | {role} | tier={tier} | "
+          f"слои {layer_start}-{layer_end} | ws={client_ip}:{ws_port} | "
+          f"покрытие {coverage['percent']}%")
+    return {
+        "status":         "registered",
+        "worker_id":       worker_id,
+        "specialization":  specialization,
+        "coverage":        coverage,
+    }
 
 
 # ── Pipeline pull-endpoints (для distributed узлов) ───────────────────────────
@@ -848,15 +1107,176 @@ async def network():
     }
 
 
+# ─────────────────────────────────────────
+# DISTRIBUTED PIPELINE — endpoints
+# ─────────────────────────────────────────
+
+@app.post("/assign_layers")
+async def assign_layers_endpoint(
+    worker_id: str,
+    ram_gb:    float,
+    vram_gb:   float = 0.0,
+):
+    """Узел регистрируется и получает назначение слоёв."""
+    effective = vram_gb if vram_gb > 0 else ram_gb
+    start, end = assign_layers(worker_id, effective)
+    coverage   = get_coverage()
+    return {
+        "layer_start": start,
+        "layer_end":   end,
+        "layer_count": end - start + 1,
+        "model_id":    DISTRIBUTED_MODEL["id"],
+        "coverage":    coverage,
+        "message":     f"Загрузи слои {start}-{end} через AirLLM",
+    }
+
+
+@app.post("/pipeline/chat")
+async def pipeline_chat(message: str, session_id: str = "default"):
+    """
+    Запрос идёт через цепочку узлов. Если покрытие < 80% — падаем на VPS AirLLM.
+    """
+    coverage = get_coverage()
+    chain    = build_pipeline_chain()
+
+    # Недостаточно узлов — прямой VPS inference
+    if coverage["percent"] < 80 or not chain:
+        print(f"[Pipeline] Покрытие {coverage['percent']}% — VPS fallback")
+        return await chat(message, session_id=session_id)
+
+    # Кладём задачу в очередь для первого узла цепочки
+    task_id       = str(uuid.uuid4())
+    target_worker = chain[0]["worker_id"]
+    print(f"[Pipeline] '{message[:40]}' → {target_worker[:16]} "
+          f"(покрытие {coverage['percent']}%)")
+
+    pending_activations.append({
+        "task_id":       task_id,
+        "act_bytes":     b"",          # узел получает сообщение, не активации
+        "input_shape":   "(0,)",
+        "seq_len":       0,
+        "message":       message,
+        "input_ids":     [],
+        "priority":      "balanced",
+        "target_worker": target_worker,
+        "enqueued_at":   time.time(),
+    })
+
+    # Ждём результат от узла (до 600 с для AirLLM)
+    for _ in range(1200):
+        if task_id in result_store:
+            entry = result_store.pop(task_id)
+            text  = entry["text"] if isinstance(entry, dict) else entry
+            wid   = entry.get("worker_id", target_worker) if isinstance(entry, dict) else target_worker
+            print(f"[Pipeline] ✓ от {wid[:16]}: '{text[:60]}'")
+            return {
+                "response":  text,
+                "task_id":   task_id,
+                "session_id": session_id,
+                "worker_id": wid,
+                "coverage":  coverage,
+                "pipeline":  True,
+            }
+        await asyncio.sleep(0.5)
+
+    # Таймаут — убираем из очереди
+    for i, t in enumerate(list(pending_activations)):
+        if t.get("task_id") == task_id:
+            try: del pending_activations[i]
+            except: pass
+            break
+    return {"error": "pipeline timeout — no node responded"}
+
+
+@app.get("/pipeline/status")
+async def pipeline_status():
+    """Статус распределённого pipeline."""
+    chain    = build_pipeline_chain()
+    coverage = get_coverage()
+    return {
+        "chain":             chain,
+        "coverage":          coverage,
+        "model":             DISTRIBUTED_MODEL["id"],
+        "ready":             coverage["percent"] >= 80,
+        "assignments":       {wid: {"start": s, "end": e}
+                              for wid, (s, e) in layer_assignments.items()},
+        "registered_workers": len(worker_stats),
+    }
+
+
+@app.post("/heartbeat")
+async def heartbeat(worker_id: str):
+    """Узел сообщает что жив."""
+    if worker_id in worker_stats:
+        worker_stats[worker_id]["last_seen"] = time.time()
+        worker_stats[worker_id]["status"]    = "ready"
+    return {"ok": True}
+
+
+@app.post("/ws/chat")
+async def ws_chat(message: str, priority: str = "balanced"):
+    """
+    Запрос через Reverse WebSocket (узел сам подключён к Gateway).
+    Выбирает лучший подключённый узел по tier.
+    Если узлов нет — VPS AirLLM fallback.
+    """
+    # Выбираем подключённые reverse-WS узлы
+    # (если воркер в словаре — соединение живо; handle_node_connection
+    #  удаляет его из reverse_ws_connections при отключении)
+    available = [
+        wid for wid in reverse_ws_connections
+        if worker_stats.get(wid, {}).get("status") == "ready"
+    ]
+
+    if not available:
+        print(f"[Gateway] /ws/chat: нет reverse-WS узлов → VPS fallback")
+        return await chat(message)
+
+    # Выбираем лучший по tier
+    tier_order = {"gpu": 0, "fast_cpu": 1, "slow_cpu": 2}
+    worker_id  = min(
+        available,
+        key=lambda wid: tier_order.get(
+            worker_stats.get(wid, {}).get("tier", "slow_cpu"), 3
+        )
+    )
+
+    task_id = str(uuid.uuid4())
+    ls = worker_stats[worker_id].get("layer_start", 0)
+    le = worker_stats[worker_id].get("layer_end",   31)
+    print(f"[Gateway] /ws/chat '{message[:50]}' → {worker_id[:16]} "
+          f"(слои {ls}-{le})")
+
+    try:
+        result_text = await send_task_to_worker(worker_id, {
+            "type":    "generate",
+            "task_id": task_id,
+            "message": message,
+        })
+        return {
+            "response": result_text,
+            "worker":   worker_id,
+            "task_id":  task_id,
+            "layers":   f"{ls}-{le}",
+            "backend":  "airllm_ws",
+        }
+    except Exception as e:
+        print(f"[Gateway] /ws/chat ошибка: {e} → VPS fallback")
+        return await chat(message)
+
+
 @app.get("/health")
 def health():
     return {
-        "status":      "ok",
-        "model":       MODEL_NAME,
-        "backend":     "airllm",
-        "layers":      f"{LAYER_START}-{LAYER_END}",
-        "total_layers": total_layers,
-        "queue_size":  len(pending_activations),
+        "status":           "ok",
+        "model":            MODEL_NAME,
+        "backend":          "airllm",
+        "layers":           f"{LAYER_START}-{LAYER_END}",
+        "total_layers":     total_layers,
+        "queue_size":       len(pending_activations),
+        "pipeline_ready":   get_coverage()["percent"] >= 80,
+        "ws_port":          WS_PORT,
+        "reverse_ws_nodes": len(reverse_ws_connections),
     }
 
 
