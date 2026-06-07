@@ -72,3 +72,21 @@ class Neuron:
     def identity_distance(self):
         return float(self.gates.abs().mean() + self.phase.abs().mean())
 
+    def save(self, path: str):
+        torch.save({
+            "gates":    self.gates,
+            "phase":    self.phase,
+            "baseline": self.baseline,
+            "tasks":    self.tasks_done,
+        }, path)
+
+    @classmethod
+    def load(cls, path: str, **kwargs) -> "Neuron":
+        obj  = cls(**kwargs)
+        data = torch.load(path, weights_only=True)
+        obj.gates      = data["gates"]
+        obj.phase      = data.get("phase",    torch.zeros_like(obj.gates))
+        obj.baseline   = data.get("baseline", None)
+        obj.tasks_done = data.get("tasks",    0)
+        return obj
+

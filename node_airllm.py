@@ -36,7 +36,13 @@ import time
 import socket
 import torch
 import websockets
+import httpx
 from huggingface_hub import hf_hub_download
+
+# EFCT — adaptive gates
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from neuron import Neuron
 
 # ─────────────────────────────────────────
 # АРГУМЕНТЫ
@@ -57,6 +63,8 @@ parser.add_argument('--layer-start', type=int, default=-1,
     help='Принудительный старт слоёв (-1 = от Gateway)')
 parser.add_argument('--layer-end',   type=int, default=-1,
     help='Принудительный конец слоёв (-1 = от Gateway)')
+parser.add_argument('--gateway-http', default='http://217.160.49.222:8002',
+    help='HTTP адрес Gateway для EFCT федерации (порт 8002)')
 args = parser.parse_args()
 
 WORKER_ID  = args.worker_id
@@ -87,6 +95,25 @@ print(f"[Node] Worker : {WORKER_ID}")
 print(f"[Node] Gateway: {GATEWAY_WS}")
 print(f"[Node] Device : {device} ({tier})")
 print(f"[Node] RAM    : {ram_gb:.1f} GB | VRAM: {vram_gb:.1f} GB")
+
+# ─────────────────────────────────────────
+# EFCT — adaptive gates
+# ─────────────────────────────────────────
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+GATEWAY_HTTP  = args.gateway_http
+GATES_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f"gates_{socket.gethostname()}.pt")
+FEDERATION_N  = 10   # федеративная синхронизация каждые N задач
+
+# Загружаем сохранённые gates если есть, иначе — новый нейрон
+if os.path.exists(GATES_PATH):
+    efct = Neuron.load(GATES_PATH)
+    print(f"[EFCT] Gates загружены: {GATES_PATH} (задач: {efct.tasks_done})")
+else:
+    efct = Neuron()
+    print(f"[EFCT] Новый нейрон инициализирован")
+
+tasks_done_efct = efct.tasks_done   # продолжаем счётчик с сохранённого
 
 # ─────────────────────────────────────────
 # SYSTEM PROMPT
@@ -253,6 +280,70 @@ def run_inference(mdl_bundle: dict, message: str, max_new_tokens: int = 200) -> 
     return text
 
 # ─────────────────────────────────────────
+# EFCT — внешний сигнал качества через Groq
+# ─────────────────────────────────────────
+
+async def get_quality_signal(message: str, answer: str) -> float | None:
+    """
+    Groq Llama-3.1-8b-instant оценивает качество ответа → [0.0, 1.0].
+    Возвращает None если GROQ_API_KEY не задан или запрос упал.
+    Timeout 8с — не блокирует pipeline при недоступности Groq.
+    """
+    if not GROQ_API_KEY or not answer.strip():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system",
+                         "content": "Rate answer quality 0.0-1.0. Return ONLY a number."},
+                        {"role": "user",
+                         "content": f"Question: {message}\nAnswer: {answer}\nScore:"},
+                    ],
+                    "max_tokens": 10,
+                    "temperature": 0.0,
+                },
+            )
+        score = float(resp.json()["choices"][0]["message"]["content"].strip())
+        return max(0.0, min(1.0, score))
+    except Exception as e:
+        print(f"[EFCT] Groq недоступен: {e}")
+        return None
+
+
+async def federate_gates():
+    """
+    Отправляем текущие gates на Gateway (/gates/upload),
+    скачиваем глобальный агрегат (/gates/global) и применяем.
+    """
+    global efct
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Upload
+            await client.post(
+                f"{GATEWAY_HTTP}/gates/upload",
+                params={"worker_id": WORKER_ID, "tasks_done": efct.tasks_done},
+                json={"gates": efct.gates.cpu().tolist(),
+                      "phase": efct.phase.cpu().tolist()},
+            )
+            # Download global aggregate
+            resp = await client.get(f"{GATEWAY_HTTP}/gates/global")
+            data = resp.json()
+            if data.get("status") == "ok" and data.get("gates"):
+                efct.gates = torch.tensor(data["gates"], dtype=efct.gates.dtype)
+                efct.phase = torch.tensor(data["phase"], dtype=efct.phase.dtype)
+                print(f"[EFCT] Федерация применена "
+                      f"(участников: {data.get('contributors', '?')})", flush=True)
+    except Exception as e:
+        print(f"[EFCT] Федерация недоступна: {e}", flush=True)
+
+
+# ─────────────────────────────────────────
 # ОСНОВНОЙ ЦИКЛ — подключение и работа
 # ─────────────────────────────────────────
 async def connect_and_work():
@@ -346,6 +437,27 @@ async def connect_and_work():
                             elapsed = time.time() - t0
                             print(f"[Node] ✓ Готово за {elapsed:.1f}с: "
                                   f"'{result_text[:60]}'")
+
+                            # ── EFCT: reward сигнал → обновление gates ───────
+                            global tasks_done_efct
+                            quality = await get_quality_signal(text, result_text)
+                            if quality is not None:
+                                efct.local_update(quality)
+                                signal_src = "groq"
+                            else:
+                                efct.local_update(0.5)   # нейтральный fallback
+                                signal_src = "neutral"
+
+                            tasks_done_efct += 1
+                            efct.save(GATES_PATH)
+                            print(f"[EFCT] task={tasks_done_efct} "
+                                  f"signal={signal_src}({quality or 0.5:.3f}) "
+                                  f"baseline={efct.baseline:.4f} "
+                                  f"dist={efct.identity_distance():.6f}", flush=True)
+
+                            if tasks_done_efct % FEDERATION_N == 0:
+                                await federate_gates()
+                            # ─────────────────────────────────────────────────
 
                             await ws.send(json.dumps({
                                 "type":      "result",
