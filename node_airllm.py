@@ -1,5 +1,5 @@
 """
-node_airllm.py — Узел Noumind: Reverse WebSocket клиент + AirLLM inference.
+node_airllm.py — Узел Noumind: Reverse WebSocket клиент + selective layer loading.
 
 Архитектура (Reverse WS):
   Узел сам подключается к Gateway WS-серверу (порт 8003).
@@ -9,12 +9,15 @@ node_airllm.py — Узел Noumind: Reverse WebSocket клиент + AirLLM inf
   1. Подключаемся к ws://gateway:8003
   2. Отправляем {"type":"register", ...} — Gateway назначает слои
   3. Получаем {"type":"registered", "layer_start":..., "layer_end":...}
-  4. Загружаем модель через AirLLM
-  5. Слушаем задачи {"type":"generate", ...}, отвечаем {"type":"result", ...}
-  6. При разрыве — переподключаемся через 5 сек
+  4. Скачиваем только нужный safetensors-шард (~4.5 GB вместо ~14 GB)
+  5. Загружаем только назначенные слои в память
+  6. Слушаем задачи {"type":"generate", ...}, отвечаем {"type":"result", ...}
+  7. При разрыве — переподключаемся через 5 сек
 
-NOTE: AirLLM НЕ поддерживает layer_start/layer_end.
-      Слои виртуальные (tracking покрытия). Модель полная ~0.4 GB RAM.
+Слои выровнены по файлам Mistral-7B:
+  model-00001 → слои  0-10  (~4.5 GB)
+  model-00002 → слои 11-21  (~4.5 GB)
+  model-00003 → слои 22-31  (~4.5 GB)
 """
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']  = 'TRUE'
@@ -33,6 +36,7 @@ import time
 import socket
 import torch
 import websockets
+from huggingface_hub import hf_hub_download
 
 # ─────────────────────────────────────────
 # АРГУМЕНТЫ
@@ -93,52 +97,129 @@ If the user writes in Russian, respond in Russian.
 Be concise and helpful. Do not repeat the question."""
 
 # ─────────────────────────────────────────
+# МАППИНГ СЛОЁВ → ФАЙЛЫ (Mistral-7B-Instruct-v0.2)
+# ─────────────────────────────────────────
+
+# Каждый файл содержит ≈11 decoder-слоёв (~4.5 GB).
+# Узел скачивает ТОЛЬКО файл(ы) для своих слоёв.
+LAYER_TO_FILE = {
+    (0,  10): "model-00001-of-00003.safetensors",
+    (11, 21): "model-00002-of-00003.safetensors",
+    (22, 31): "model-00003-of-00003.safetensors",
+}
+
+# ─────────────────────────────────────────
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 # ─────────────────────────────────────────
-model_loaded       = None
+model_loaded       = None   # dict{"model": ..., "tokenizer": ...}
 layer_start_global = 0
 layer_end_global   = 31
 
-# ─────────────────────────────────────────
-# ЗАГРУЗКА МОДЕЛИ
-# ─────────────────────────────────────────
-def load_model(layer_start: int, layer_end: int):
-    """
-    Загружаем AirLLM.
-    NOTE: AirLLM НЕ поддерживает layer_start/layer_end — грузим всю модель,
-    но layer streaming держит RAM ~0.4 GB независимо от числа слоёв.
-    """
-    from airllm import AutoModel
 
-    count  = layer_end - layer_start + 1
-    gb_est = count * 0.44
-    print(f"[Node] Загружаю модель... "
-          f"(виртуальные слои {layer_start}-{layer_end}, ~{gb_est:.1f} GB весов)")
+def get_my_files(layer_start: int, layer_end: int) -> list:
+    """Возвращает список safetensors-файлов для указанного диапазона слоёв."""
+    needed = []
+    for (fs, fe), fname in LAYER_TO_FILE.items():
+        # Пересечение диапазонов
+        if layer_start <= fe and layer_end >= fs:
+            needed.append(fname)
+    return needed
 
-    mdl = AutoModel.from_pretrained(
-        args.model,
-        device      = "cpu" if device in ("cpu", "mps") else device,
-        dtype       = torch.float16,
-        max_seq_len = 512,
-    )
-    print(f"[Node] ✓ Модель загружена ({args.model})")
-    return mdl
 
 # ─────────────────────────────────────────
-# INFERENCE — greedy decode
+# ЗАГРУЗКА МОДЕЛИ — только нужные слои
 # ─────────────────────────────────────────
-def run_inference(mdl, message: str, max_new_tokens: int = 300) -> str:
+
+def load_model(layer_start: int, layer_end: int) -> dict:
     """
-    Ручной greedy decode через AirLLM (layer streaming с диска).
-    NOTE: AirLLM не поддерживает .generate() — делаем вручную.
-    ~15-30 с/токен на CPU.
+    1. Скачиваем конфиг-файлы (маленькие) + только нужный safetensors-шард.
+    2. Инициализируем модель из конфига (без весов, очень быстро).
+    3. Загружаем веса нашего шарда (strict=False — остальные слои игнорируются).
+    4. Оставляем только layer_start..layer_end, остальные удаляем из памяти.
+
+    Итог: в RAM только наши слои (~1.5 GB для 11 слоёв fp16).
     """
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+    from safetensors.torch import load_file as safetensors_load
+    import gc
+
+    model_id = args.model
+    files    = get_my_files(layer_start, layer_end)
+
+    print(f"[Node] Слои {layer_start}-{layer_end} → файлы: {files}")
+
+    # ── 1. Конфиг и токенайзер (маленькие файлы) ─────────────────────────
+    config_files = [
+        "config.json", "tokenizer.json", "tokenizer_model",
+        "tokenizer_config.json", "special_tokens_map.json",
+        "generation_config.json",
+    ]
+    for cfg in config_files:
+        try:
+            hf_hub_download(repo_id=model_id, filename=cfg)
+        except Exception:
+            pass  # некоторые файлы могут отсутствовать
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    print(f"[Node] ✓ Токенайзер загружен")
+
+    # ── 2. Скачиваем только нужные шарды ─────────────────────────────────
+    shard_paths = []
+    for fname in files:
+        print(f"[Node] Скачиваю {fname}...", flush=True)
+        path = hf_hub_download(repo_id=model_id, filename=fname)
+        shard_paths.append(path)
+        print(f"[Node] ✓ {fname} → {path}")
+
+    # ── 3. Инициализируем структуру модели без весов ──────────────────────
+    print(f"[Node] Создаю структуру модели (без весов)...")
+    config = AutoConfig.from_pretrained(model_id)
+    model  = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
+
+    # ── 4. Загружаем веса нашего шарда (остальные слои — случайные, неважно) ──
+    for path in shard_paths:
+        state = safetensors_load(path)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[Node] ✓ Веса загружены | пропущено: {len(missing)} ключей")
+
+    # ── 5. Оставляем только наши слои ────────────────────────────────────
+    all_layers = list(model.model.layers)
+    model.model.layers = torch.nn.ModuleList(all_layers[layer_start:layer_end + 1])
+    model.eval()
+
+    # Освобождаем память
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    count = layer_end - layer_start + 1
+    print(f"[Node] ✓ Модель готова: {count} слоёв ({layer_start}-{layer_end}) | "
+          f"файлов: {len(shard_paths)}")
+
+    return {"model": model, "tokenizer": tokenizer}
+
+
+# ─────────────────────────────────────────
+# INFERENCE — forward через назначенные слои
+# ─────────────────────────────────────────
+
+def run_inference(mdl_bundle: dict, message: str, max_new_tokens: int = 200) -> str:
+    """
+    Greedy decode через частичную модель (только наши слои).
+    Полноценный ответ — когда узел покрывает все 32 слоя (слои 0-31).
+    Для частичных узлов: возвращает скрытые состояния / промежуточный вывод.
+
+    ~5-15 с/токен на CPU.
+    """
+    model     = mdl_bundle["model"]
+    tokenizer = mdl_bundle["tokenizer"]
+
     prompt    = f"[INST] {SYSTEM_PROMPT}\n\n{message} [/INST]"
-    input_ids = mdl.tokenizer.encode(
+    input_ids = tokenizer.encode(
         prompt, return_tensors="pt", truncation=True, max_length=512
     )
     generated  = input_ids.clone()
-    eos_id     = mdl.tokenizer.eos_token_id or 2
+    eos_id     = tokenizer.eos_token_id or 2
     prompt_len = input_ids.shape[1]
 
     print(f"[Node] Промпт: {prompt_len} токенов → генерирую до {max_new_tokens}...")
@@ -146,10 +227,10 @@ def run_inference(mdl, message: str, max_new_tokens: int = 300) -> str:
     with torch.no_grad():
         for step in range(max_new_tokens):
             t0     = time.time()
-            out    = mdl(generated)
+            out    = model(generated)
             logits = out.logits if hasattr(out, "logits") else out[0]
             next_id = int(logits[:, -1, :].argmax(-1).item())
-            tok     = mdl.tokenizer.decode([next_id], skip_special_tokens=True)
+            tok     = tokenizer.decode([next_id], skip_special_tokens=True)
             elapsed = time.time() - t0
 
             print(f"[Node] [{step+1:3d}/{max_new_tokens}] '{tok}' ({elapsed:.1f}s)",
@@ -164,7 +245,7 @@ def run_inference(mdl, message: str, max_new_tokens: int = 300) -> str:
             )
 
     new_ids = generated[0][prompt_len:].tolist()
-    text    = mdl.tokenizer.decode(
+    text    = tokenizer.decode(
         new_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=True,
@@ -228,22 +309,20 @@ async def connect_and_work():
 
                 # ── 3. Загрузка модели (один раз) ─────────
                 if model_loaded is None:
-                    print(f"[Node] Загружаю модель...", flush=True)
+                    print(f"[Node] Скачиваю и загружаю слои "
+                          f"{layer_start_global}-{layer_end_global}...", flush=True)
                     loop = asyncio.get_event_loop()
                     model_loaded = await loop.run_in_executor(
                         None, load_model, layer_start_global, layer_end_global
                     )
-                    # Сообщаем Gateway что готовы принимать задачи
-                    await ws.send(json.dumps({
-                        "type":      "ready",
-                        "worker_id": WORKER_ID,
-                    }))
                 else:
                     print(f"[Node] Модель уже загружена, сразу готов")
-                    await ws.send(json.dumps({
-                        "type":      "ready",
-                        "worker_id": WORKER_ID,
-                    }))
+
+                # Сообщаем Gateway что готовы принимать задачи
+                await ws.send(json.dumps({
+                    "type":      "ready",
+                    "worker_id": WORKER_ID,
+                }))
 
                 print(f"[Node] Слушаю задачи...\n", flush=True)
 

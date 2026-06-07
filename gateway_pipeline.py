@@ -301,43 +301,42 @@ DISTRIBUTED_MODEL = {
     "layers_per_gb": 2.5,   # слоёв на 1 GB RAM/VRAM
 }
 
+# Маппинг границ слоёв → файл весов.
+# Узел скачивает ровно один файл (~4.5 GB) вместо всей модели (~14 GB).
+LAYER_FILES: Dict[tuple, str] = {
+    (0,  10): "model-00001-of-00003.safetensors",
+    (11, 21): "model-00002-of-00003.safetensors",
+    (22, 31): "model-00003-of-00003.safetensors",
+}
+
 layer_assignments: Dict[str, tuple] = {}   # worker_id → (start, end)
 
 
 def assign_layers(worker_id: str, ram_gb: float) -> tuple:
-    """Назначаем узлу незанятые слои, пропорционально его RAM."""
-    total = DISTRIBUTED_MODEL["total_layers"]
-
+    """
+    Назначаем узлу целый файл весов (0-10, 11-21 или 22-31).
+    Границы выровнены по safetensors-шардам: узел скачивает ровно 1 файл (~4.5 GB).
+    Если все файлы заняты — переназначаем первый.
+    """
     occupied: set = set()
     for wid, (s, e) in layer_assignments.items():
         if wid != worker_id:
             for ll in range(s, e + 1):
                 occupied.add(ll)
 
-    my_count = max(1, min(
-        int(ram_gb * DISTRIBUTED_MODEL["layers_per_gb"]),
-        total - len(occupied),
-    ))
+    for (file_start, file_end), filename in LAYER_FILES.items():
+        file_layers = set(range(file_start, file_end + 1))
+        if not (file_layers & occupied):
+            layer_assignments[worker_id] = (file_start, file_end)
+            print(f"[Gateway] {worker_id[:16]}: слои {file_start}-{file_end} "
+                  f"({filename})")
+            return file_start, file_end
 
-    # Первый свободный непрерывный диапазон
-    start = 0
-    while start < total and start in occupied:
-        start += 1
-
-    end = min(start + my_count - 1, total - 1)
-
-    # Если диапазон пересекается — сдвигаем дальше
-    while any(ll in occupied for ll in range(start, end + 1)) and start < total:
-        start = end + 1
-        end   = min(start + my_count - 1, total - 1)
-    if start >= total:
-        start = 0
-        end   = min(my_count - 1, total - 1)
-
-    layer_assignments[worker_id] = (start, end)
-    print(f"[Gateway] {worker_id[:16]}: слои {start}-{end} "
-          f"({my_count} сл, {ram_gb:.1f} GB)")
-    return start, end
+    # Все файлы заняты — назначаем первый (fallback)
+    (fs, fe), fn = next(iter(LAYER_FILES.items()))
+    layer_assignments[worker_id] = (fs, fe)
+    print(f"[Gateway] {worker_id[:16]}: все файлы заняты → {fs}-{fe} ({fn})")
+    return fs, fe
 
 
 def build_pipeline_chain() -> list:
@@ -1194,10 +1193,14 @@ async def pipeline_status():
     chain    = build_pipeline_chain()
     coverage = get_coverage()
     return {
-        "chain":             chain,
+        "model":       DISTRIBUTED_MODEL["id"],
+        "layer_files": {
+            f"{s}-{e}": fname
+            for (s, e), fname in LAYER_FILES.items()
+        },
         "coverage":          coverage,
-        "model":             DISTRIBUTED_MODEL["id"],
         "ready":             coverage["percent"] >= 80,
+        "chain":             chain,
         "assignments":       {wid: {"start": s, "end": e}
                               for wid, (s, e) in layer_assignments.items()},
         "registered_workers": len(worker_stats),
