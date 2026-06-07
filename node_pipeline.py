@@ -3,6 +3,11 @@ node_pipeline.py — Узел пользователя
 Держит слои 11-21 TinyLlama + EFCT нейрон.
 Pull-модель: сам опрашивает Gateway каждые 2 сек.
 """
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 # -*- coding: utf-8 -*-
 import sys
 import io
