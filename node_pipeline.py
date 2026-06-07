@@ -216,7 +216,7 @@ def forward_second_half(hidden: torch.Tensor) -> torch.Tensor:
 
 def autoregressive_decode(first_activations: torch.Tensor,
                           input_ids_list: list,
-                          max_new_tokens: int = 150,
+                          max_new_tokens: int = 300,
                           min_new_tokens: int = 8,
                           token_callback=None,
                           temperature: float = 0.7,
@@ -424,7 +424,7 @@ def process_activations(act_b64: str, message: str = "", input_ids: list = None,
         actual_cb = token_callback
 
     text, confidence = autoregressive_decode(
-        activations, ids, max_new_tokens=150, token_callback=actual_cb,
+        activations, ids, max_new_tokens=300, token_callback=actual_cb,
         temperature=0.7, top_p=0.9,
     )
     elapsed = time.time() - t_start
